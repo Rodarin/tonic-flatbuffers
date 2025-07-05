@@ -1,6 +1,10 @@
-use std::io;
-use std::path::Path;
-use std::rc::{Rc, Weak};
+use regex::Regex;
+use std::{
+    collections::HashMap,
+    fs, io,
+    path::Path,
+    rc::{Rc, Weak},
+};
 
 #[derive(Clone, Debug)]
 pub enum NamespaceChild {
@@ -35,6 +39,7 @@ pub struct EndpointNode {
     pub parent: Option<Weak<ServiceNode>>,
     pub request_type: Rc<TypeNode>,
     pub response_type: Rc<TypeNode>,
+    pub streaming: String,
 }
 
 pub trait TreeNode {
@@ -85,8 +90,6 @@ impl EndpointNode {
     }
 }
 
-use std::collections::HashMap;
-
 pub struct Forest {
     pub roots: Vec<Rc<NamespaceNode>>,
     pub type_lookup: HashMap<String, Rc<TypeNode>>,
@@ -99,88 +102,135 @@ impl Forest {
 
     /// Build a Forest from a list of .fbs files
     pub fn from_fbs_files(fbs_files: &[impl AsRef<Path>]) -> io::Result<Self> {
-        use std::collections::HashMap;
-        use std::fs;
-
         let mut namespace_map: HashMap<String, Rc<NamespaceNode>> = HashMap::new();
         let mut type_lookup: HashMap<String, Rc<TypeNode>> = HashMap::new();
 
+        // Regex declarations for parsing
+        let namespace_re = Regex::new(r"(?m)^\s*namespace\s+([a-zA-Z0-9_.]+)\s*;").unwrap();
+        let type_re = Regex::new(r"\b(?:table|struct)\s+(\w+)\s*\{").unwrap();
+        let service_re = Regex::new(r"rpc_service\s+(\w+)\s*\{([^}]*)\}").unwrap();
+        let method_re = Regex::new(
+            r"(?x)
+                (\w+)\s*                # method name
+                \(\s*(\w+)\s*\)\s*      # request type
+                :\s*(\w+)\s*            # response type
+                \(\s*streaming\s*:\s*(\w+)\s*\)\s*; # streaming
+            ",
+        )
+        .unwrap();
+
         for file in fbs_files {
-            let content = fs::read_to_string(file.as_ref())?;
+            let schema = fs::read_to_string(file.as_ref())?;
             let mut current_ns = String::new();
+            let mut cursor = 0;
 
-            for line in content.lines() {
-                let line = line.trim();
+            while cursor < schema.len() {
+                if let Some(ns_cap) = namespace_re.captures(&schema[cursor..]) {
+                    let start = schema[cursor..].find(&ns_cap[0]).unwrap();
+                    cursor += start + ns_cap[0].len();
+                    current_ns = ns_cap[1].to_string();
 
-                // Parse namespace
-                if let Some(ns) = line.strip_prefix("namespace ") {
-                    if let Some(end) = ns.find(';') {
-                        current_ns = ns[..end].trim().to_string();
+                    // Build namespace chain (foo.bar.baz)
+                    let mut parent: Option<Rc<NamespaceNode>> = None;
+                    let mut ns_path = String::new();
+                    for segment in current_ns.split('.') {
+                        if !ns_path.is_empty() {
+                            ns_path.push('.');
+                        }
+                        ns_path.push_str(segment);
 
-                        // Build namespace chain (foo.bar.baz)
-                        let mut parent: Option<Rc<NamespaceNode>> = None;
-                        let mut ns_path = String::new();
-                        for segment in current_ns.split('.') {
-                            if !ns_path.is_empty() {
-                                ns_path.push('.');
-                            }
-                            ns_path.push_str(segment);
-
-                            let ns_rc = namespace_map.entry(ns_path.clone()).or_insert_with(|| {
+                        let ns_rc = namespace_map
+                            .entry(ns_path.clone())
+                            .or_insert_with(|| {
                                 Rc::new(NamespaceNode {
                                     name: segment.to_string(),
                                     parent: parent.as_ref().map(|p| Rc::downgrade(p)),
                                     children: Vec::new(),
                                 })
-                            }).clone();
+                            })
+                            .clone();
 
-                            parent = Some(ns_rc);
-                        }
+                        parent = Some(ns_rc);
                     }
+                    continue;
                 }
 
-                // Parse types (table/struct)
-                if line.starts_with("table ") || line.starts_with("struct ") {
-                    let rest = &line[6..];
-                    if let Some(end) = rest.find('{') {
-                        let name = rest[..end].trim();
-                        let fq_name = if current_ns.is_empty() {
-                            name.to_string()
-                        } else {
-                            format!("{}.{}", current_ns, name)
-                        };
-                        let ns_rc = namespace_map.get(&current_ns).unwrap().clone();
-                        let type_node = Rc::new(TypeNode {
-                            name: name.to_string(),
-                            parent: Some(Rc::downgrade(&ns_rc)),
+                // Match types (table/struct)
+                if let Some(table_cap) = type_re.captures(&schema[cursor..]) {
+                    let start = schema[cursor..].find(&table_cap[0]).unwrap();
+                    cursor += start + table_cap[0].len();
+                    let fq_name = if current_ns.is_empty() {
+                        table_cap[1].to_string()
+                    } else {
+                        format!("{}.{}", current_ns, table_cap[1].to_string())
+                    };
+                    let ns_rc = namespace_map.get(&current_ns).unwrap().clone();
+                    let type_node = Rc::new(TypeNode {
+                        name: table_cap[1].to_string(),
+                        parent: Some(Rc::downgrade(&ns_rc)),
+                    });
+                    type_lookup.insert(fq_name, type_node.clone());
+                    // Insert into namespace children
+                    Rc::get_mut(&mut Rc::clone(&ns_rc))
+                        .unwrap()
+                        .children
+                        .push(NamespaceChild::Type(type_node));
+                    continue;
+                }
+
+                // Match rpc_service
+                if let Some(svc_cap) = service_re.captures(&schema[cursor..]) {
+                    let start = schema[cursor..].find(&svc_cap[0]).unwrap();
+                    cursor += start + svc_cap[0].len();
+                    let service_name = &svc_cap[1];
+                    let body = &svc_cap[2];
+
+                    let ns_rc = namespace_map.get(&current_ns).unwrap().clone();
+                    let service_node = Rc::new(ServiceNode {
+                        name: service_name.to_string(),
+                        parent: Some(Rc::downgrade(&ns_rc)),
+                        endpoints: Vec::new(),
+                    });
+
+                    for method_cap in method_re.captures_iter(body) {
+                        let method = &method_cap[1];
+                        let request = &method_cap[2];
+                        let response = &method_cap[3];
+                        let streaming = &method_cap[4];
+                        let endpoint_node = Rc::new(EndpointNode {
+                            name: method.to_string(),
+                            parent: Some(Rc::downgrade(&service_node)),
+                            request_type: type_lookup.get(request).cloned().unwrap_or_else(|| {
+                                Rc::new(TypeNode {
+                                    name: request.to_string(),
+                                    parent: Some(Rc::downgrade(&ns_rc)),
+                                })
+                            }),
+                            response_type: type_lookup.get(response).cloned().unwrap_or_else(
+                                || {
+                                    Rc::new(TypeNode {
+                                        name: response.to_string(),
+                                        parent: Some(Rc::downgrade(&ns_rc)),
+                                    })
+                                },
+                            ),
+                            streaming: streaming.to_string(),
                         });
-                        type_lookup.insert(fq_name, type_node.clone());
-                        // Insert into namespace children
-                        Rc::get_mut(&mut Rc::clone(&ns_rc))
-                            .unwrap()
-                            .children
-                            .push(NamespaceChild::Type(type_node));
+                        Rc::get_mut(&mut Rc::clone(&service_node))
+                            .expect("ServiceNode is not unique")
+                            .endpoints
+                            .push(endpoint_node);
                     }
+
+                    continue;
                 }
 
-                // Parse services (very naive, assumes "rpc_service Name { ... }")
-                if line.starts_with("rpc_service ") {
-                    let rest = &line[12..];
-                    if let Some(end) = rest.find('{') {
-                        let name = rest[..end].trim();
-                        let ns_rc = namespace_map.get(&current_ns).unwrap().clone();
-                        let service_node = Rc::new(ServiceNode {
-                            name: name.to_string(),
-                            parent: Some(Rc::downgrade(&ns_rc)),
-                            endpoints: Vec::new(), // TODO: parse endpoints
-                        });
-                        Rc::get_mut(&mut Rc::clone(&ns_rc))
-                            .unwrap()
-                            .children
-                            .push(NamespaceChild::Service(service_node));
-                    }
+                // Move to next line if nothing matches
+                if let Some(next_line) = schema[cursor..].find('\n') {
+                    cursor += next_line + 1;
+                } else {
+                    break;
                 }
-                // TODO: Parse endpoints and attach to services
             }
         }
 
@@ -191,10 +241,7 @@ impl Forest {
             .cloned()
             .collect();
 
-        Ok(Forest {
-            roots,
-            type_lookup,
-        })
+        Ok(Forest { roots, type_lookup })
     }
 
     pub fn iter(&self) -> ForestIter {
