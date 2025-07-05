@@ -1,0 +1,15 @@
+include "shared.fbs";
+namespace example.service;
+
+table Request {
+    shared: example.shared.SharedType;
+}
+
+table Response {
+    foo: uint;
+    bar: string;
+}
+
+rpc_service CrossNamespaceService {
+    UseShared(Request): example.shared.SharedType (streaming: "none");
+}
