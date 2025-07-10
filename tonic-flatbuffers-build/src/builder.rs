@@ -1,10 +1,14 @@
+use crate::{
+    proto_file_builder::ProtoFileBuilder,
+    tree::{Forest, NamespaceChild},
+}; // Assuming your tree.rs is in the same crate
+use itertools::Itertools;
+use tonic_build::Config;
 use std::{
     collections::{HashMap, HashSet},
     io,
     path::{Path, PathBuf},
 };
-use crate::tree::{Forest, NamespaceChild}; // Assuming your tree.rs is in the same crate
-use itertools::Itertools;
 
 macro_rules! io_error {
     ($e:expr) => {
@@ -163,16 +167,6 @@ impl<'a> Service<'a> {
     }
 }
 
-fn convert_ident_to_owned(ident: &str) -> String {
-    // ident might be "example.shared.SharedType"
-    let (prefix, ident) = ident.rsplit_once('.').unwrap_or(("", ident));
-    if prefix.is_empty() {
-        format!("Owned{ident}")
-    } else {
-        format!("{prefix}.Owned{ident}")
-    }
-}
-
 pub fn configure() -> Builder {
     Builder {
         build_client: true,
@@ -282,28 +276,15 @@ impl Builder {
         // --- Build the Forest from all .fbs files ---
         let forest = Forest::from_fbs_files(fbs)?;
 
-        // --- Traverse the Forest for code generation ---
-        for node in forest.iter() {
-            match node {
-                NamespaceChild::Namespace(ns_rc) => {
-                    // Generate mod.rs, recurse, etc.
-                    println!("Generating module for namespace: {}", ns_rc.path());
-                    // You can call your codegen helpers here, passing ns_rc
-                }
-                NamespaceChild::Service(svc_rc) => {
-                    // Generate service code
-                    println!("Generating service: {}", svc_rc.path());
-                }
-                NamespaceChild::Type(ty_rc) => {
-                    // Generate type code or macro
-                    println!("Generating type: {}", ty_rc.path());
-                }
-            }
-        }
+        // --- Extract protos from the Forest ---
+        ProtoFileBuilder::new(&forest, &out_dir)
+            .build_all()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        // --- Use forest.get_type(...) for type lookups as needed ---
-        // let ty = forest.get_type("my.ns.MyType").unwrap();
+        Self::run_tonic_build(&out_dir, self.generate_default_stubs)?;
+        Self::cleanup_proto_files(&out_dir)?;
 
+        // Self::postprocess_generated_code(out_dir, file_namespace, fake_types);
         Ok(())
     }
 
@@ -326,120 +307,39 @@ impl Builder {
         service_bufs
     }
 
-    fn collect_fake_types_and_proto(
-        file: &str,
-        service_bufs: &[(usize, &str)],
-    ) -> io::Result<(
-        HashMap<String, HashSet<String>>,
-        String,
-        String,
-        HashSet<String>,
-    )> {
-        let mut fake_types: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut file_str = String::new();
-        let mut file_namespace = String::new();
-        let mut referenced_namespaces = HashSet::new();
-
-        for (start_idx, buf) in service_bufs {
-            let namespace = if let Some(ns_idx) = file[..*start_idx].rfind("namespace") {
-                let end_idx = ok_or_invalid_service!(file[ns_idx..].find(';'))? + ns_idx;
-                let ns_buf = file[ns_idx..end_idx].replace(['\n', '\r'], "");
-                let (_, namespace) = ok_or_invalid_service!(ns_buf.split_once(' '))?;
-                namespace.trim().to_string()
-            } else {
-                String::new()
-            };
-            file_namespace = namespace.clone();
-            let service = Service::parse(buf, &namespace)?;
-
-            file_str.push_str(&format!("service {} {{", service.name));
-
-            for endpoint in service.endpoints.iter() {
-                let input_ns = endpoint
-                    .req
-                    .rsplit_once('.')
-                    .map(|(ns, _)| ns)
-                    .unwrap_or(&namespace);
-                let output_ns = endpoint
-                    .resp
-                    .rsplit_once('.')
-                    .map(|(ns, _)| ns)
-                    .unwrap_or(&namespace);
-
-                let input_ident = convert_ident_to_owned(endpoint.req);
-                let output_ident = convert_ident_to_owned(endpoint.resp);
-
-                // Track types by their actual namespace
-                fake_types
-                    .entry(input_ns.to_string())
-                    .or_default()
-                    .insert(input_ident.clone());
-                fake_types
-                    .entry(output_ns.to_string())
-                    .or_default()
-                    .insert(output_ident.clone());
-
-                referenced_namespaces.insert(input_ns.to_string());
-                referenced_namespaces.insert(output_ns.to_string());
-
-                let input = if let Some(meta) = endpoint.streaming {
-                    if meta == "client" || meta == "bidi" {
-                        format!("stream {}", input_ident)
-                    } else {
-                        input_ident.clone()
-                    }
-                } else {
-                    input_ident.clone()
-                };
-
-                let output = if let Some(meta) = endpoint.streaming {
-                    if meta == "server" || meta == "bidi" {
-                        format!("stream {}", output_ident)
-                    } else {
-                        output_ident.clone()
-                    }
-                } else {
-                    output_ident.clone()
-                };
-
-                file_str.push_str(&format!(
-                    "\n    rpc {} ({}) returns ({});",
-                    endpoint.name, input, output
-                ));
+    fn generate_fake_proto_files(forest: &Forest) -> HashMap<String, String> {
+        // --- Traverse the Forest for code generation ---
+        for node in forest.iter() {
+            match node {
+                NamespaceChild::Namespace(ns_rc) => {
+                    // Generate mod.rs, recurse, etc.
+                    println!("Generating module for namespace: {}", ns_rc.path());
+                    // You can call your codegen helpers here, passing ns_rc
+                }
+                NamespaceChild::Service(svc_rc) => {
+                    // Generate service code
+                    println!("Generating service: {}", svc_rc.path());
+                }
+                NamespaceChild::Type(ty_rc) => {
+                    // Generate type code or macro
+                    println!("Generating type: {}", ty_rc.path());
+                }
             }
-
-            file_str.push_str("\n}\n")
         }
 
-        println!("DEBUG: fake_types = {{");
-        for (ns, types) in &fake_types {
-            println!("  \"{}\": [", ns);
-            for t in types {
-                println!("    \"{}\",", t);
-            }
-            println!("  ],");
-        }
-        println!("}}");
-
-        Ok((fake_types, file_namespace, file_str, referenced_namespaces))
-    }
-
-    fn generate_fake_proto_files(
-        fake_types: &HashMap<String, HashSet<String>>,
-    ) -> HashMap<String, String> {
         let mut files = HashMap::new();
-        for (namespace, types) in fake_types {
-            // No leading/trailing whitespace before/after package line
-            let mut file_str = format!("syntax = \"proto3\";\npackage {};\n", namespace.trim());
-            for typename in types {
-                let (_, typename) = typename.rsplit_once('.').unwrap_or(("", typename));
-                file_str.push_str(&format!("\nmessage {} {{}}", typename));
-            }
-            let filename = format!("fake_{}.proto", namespace.trim());
-            println!("DEBUG: Generating proto file: {}", filename);
-            println!("DEBUG: Proto file content:\n{}", file_str);
-            files.insert(filename, file_str);
-        }
+        // for (namespace, types) in fake_types {
+        //     // No leading/trailing whitespace before/after package line
+        //     let mut file_str = format!("syntax = \"proto3\";\npackage {};\n", namespace.trim());
+        //     for typename in types {
+        //         let (_, typename) = typename.rsplit_once('.').unwrap_or(("", typename));
+        //         file_str.push_str(&format!("\nmessage {} {{}}", typename));
+        //     }
+        //     let filename = format!("fake_{}.proto", namespace.trim());
+        //     println!("DEBUG: Generating proto file: {}", filename);
+        //     println!("DEBUG: Proto file content:\n{}", file_str);
+        //     files.insert(filename, file_str);
+        // }
         files
     }
 
@@ -466,6 +366,8 @@ impl Builder {
     }
 
     fn run_tonic_build(out_dir: &str, generate_default_stubs: bool) -> io::Result<()> {
+        let mut config = Config::new();
+        config.protoc_executable(protobuf_src::protoc());
         tonic_build::configure()
             .build_client(true)
             .build_server(true)
@@ -473,7 +375,7 @@ impl Builder {
             .emit_rerun_if_changed(false)
             .generate_default_stubs(generate_default_stubs)
             .out_dir(out_dir)
-            .compile_protos(&[&format!("{out_dir}/generated.proto")], &[out_dir])?;
+            .compile_protos_with_config(config, &[&format!("{out_dir}/generated.proto")], &[out_dir])?;
         Ok(())
     }
 
@@ -497,10 +399,16 @@ impl Builder {
         fake_types: &HashMap<String, HashSet<String>>,
     ) -> io::Result<()> {
         let rust_file_path = format!("{out_dir}/{file_namespace}.rs");
-        println!("[postprocess] Looking for generated Rust file: {}", rust_file_path);
+        println!(
+            "[postprocess] Looking for generated Rust file: {}",
+            rust_file_path
+        );
 
         if !std::path::Path::new(&rust_file_path).exists() {
-            eprintln!("[postprocess] Expected generated Rust file does not exist: {}", rust_file_path);
+            eprintln!(
+                "[postprocess] Expected generated Rust file does not exist: {}",
+                rust_file_path
+            );
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Generated Rust file not found: {}", rust_file_path),
@@ -510,11 +418,17 @@ impl Builder {
         let mut file = match std::fs::read_to_string(&rust_file_path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[postprocess] Failed to read generated Rust file '{}': {}", rust_file_path, e);
+                eprintln!(
+                    "[postprocess] Failed to read generated Rust file '{}': {}",
+                    rust_file_path, e
+                );
                 return Err(e);
             }
         };
-        println!("[postprocess] Read generated Rust file ({} bytes)", file.len());
+        println!(
+            "[postprocess] Read generated Rust file ({} bytes)",
+            file.len()
+        );
         println!("[postprocess] Rust file BEFORE modification:\n{}", file);
 
         let mut owned_list = HashSet::new();
@@ -524,12 +438,15 @@ impl Builder {
             for fake_type in type_list {
                 let (_, typename) = fake_type.rsplit_once('.').unwrap_or(("", fake_type));
                 owned_list.insert(typename);
-                        let pat = match regex::Regex::new(&format!(
+                let pat = match regex::Regex::new(&format!(
                     r"(?:#\[\w+\([\w, =:]+\)\]\n)*pub struct (?:{typename}) \{{\}}\n"
                 )) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("[postprocess] Regex error for typename '{}': {}", typename, e);
+                        eprintln!(
+                            "[postprocess] Regex error for typename '{}': {}",
+                            typename, e
+                        );
                         return Err(io::Error::new(io::ErrorKind::Other, e));
                     }
                 };
@@ -538,7 +455,11 @@ impl Builder {
                 file = pat.replace(&file, "").into_owned();
                 let after = file.len();
                 if before != after {
-                    println!("[postprocess] Removed fake type '{}' ({} bytes removed)", typename, before - after);
+                    println!(
+                        "[postprocess] Removed fake type '{}' ({} bytes removed)",
+                        typename,
+                        before - after
+                    );
                 }
             }
         }
@@ -557,15 +478,28 @@ impl Builder {
         namespace_path.push("grpc.rs");
 
         println!("[postprocess] Rust file AFTER modification:\n{}", file);
-        println!("[postprocess] Writing processed Rust file to: {}", namespace_path.display());
+        println!(
+            "[postprocess] Writing processed Rust file to: {}",
+            namespace_path.display()
+        );
         if let Err(e) = std::fs::write(&namespace_path, &file) {
-            eprintln!("[postprocess] Failed to write processed Rust file '{}': {}", namespace_path.display(), e);
+            eprintln!(
+                "[postprocess] Failed to write processed Rust file '{}': {}",
+                namespace_path.display(),
+                e
+            );
             return Err(e);
         }
 
-        println!("[postprocess] Removing original Rust file: {}", rust_file_path);
+        println!(
+            "[postprocess] Removing original Rust file: {}",
+            rust_file_path
+        );
         if let Err(e) = std::fs::remove_file(&rust_file_path) {
-            eprintln!("[postprocess] Failed to remove original Rust file '{}': {}", rust_file_path, e);
+            eprintln!(
+                "[postprocess] Failed to remove original Rust file '{}': {}",
+                rust_file_path, e
+            );
             // Not fatal, so don't return here
         }
 
@@ -574,7 +508,10 @@ impl Builder {
         let file = match std::fs::read_to_string(&mod_rs_path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[postprocess] Failed to read mod.rs '{}': {}", mod_rs_path, e);
+                eprintln!(
+                    "[postprocess] Failed to read mod.rs '{}': {}",
+                    mod_rs_path, e
+                );
                 return Err(e);
             }
         };
@@ -583,7 +520,10 @@ impl Builder {
         let mut mod_def: syn::ItemMod = match syn::parse_str(&file) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[postprocess] Failed to parse mod.rs as syn::ItemMod: {}", e);
+                eprintln!(
+                    "[postprocess] Failed to parse mod.rs as syn::ItemMod: {}",
+                    e
+                );
                 return Err(io_error!(e));
             }
         };
@@ -592,8 +532,13 @@ impl Builder {
         println!("[postprocess] Namespace segments: {:?}", namespace_segments);
 
         if namespace_segments.len() > 1 {
-            if let Err(e) = Self::insert_mods_static(&namespace_segments, 0, &mut mod_def, &owned_list) {
-                eprintln!("[postprocess] Failed to insert mods for namespace {:?}: {}", namespace_segments, e);
+            if let Err(e) =
+                Self::insert_mods_static(&namespace_segments, 0, &mut mod_def, &owned_list)
+            {
+                eprintln!(
+                    "[postprocess] Failed to insert mods for namespace {:?}: {}",
+                    namespace_segments, e
+                );
                 return Err(e);
             }
         } else if let Some((_, items)) = mod_def.content.as_mut() {
@@ -614,7 +559,10 @@ impl Builder {
         println!("[postprocess] mod.rs AFTER modification:\n{}", new_file);
         println!("[postprocess] Writing updated mod.rs: {}", mod_rs_path);
         if let Err(e) = std::fs::write(&mod_rs_path, new_file) {
-            eprintln!("[postprocess] Failed to write updated mod.rs '{}': {}", mod_rs_path, e);
+            eprintln!(
+                "[postprocess] Failed to write updated mod.rs '{}': {}",
+                mod_rs_path, e
+            );
             return Err(e);
         }
 
